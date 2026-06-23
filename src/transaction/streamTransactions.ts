@@ -1,7 +1,7 @@
 import { Horizon } from "@stellar/stellar-sdk";
 import { ok, err, SorokitErrorCode } from "../shared/response";
 import type { SorokitResult } from "../shared/response";
-import { sleep, toMessage, isNotFoundError } from "../shared";
+import { sleep, toMessage, isNotFoundError, deepEqual } from "../shared";
 import type { TransactionResult } from "./types";
 
 /**
@@ -79,6 +79,7 @@ export async function* streamTransactions(
 
   let cursor = config?.cursor;
   let polls = 0;
+  let lastEmitted: TransactionPage | undefined;
 
   while (true) {
     if (signal?.aborted) return;
@@ -124,7 +125,11 @@ export async function* streamTransactions(
       const lastRecord = page.records[page.records.length - 1];
       const nextCursor = lastRecord?.paging_token ?? null;
 
-      yield ok({ transactions, nextCursor });
+      const page_result = { transactions, nextCursor };
+      if (!deepEqual(page_result, lastEmitted)) {
+        lastEmitted = page_result;
+        yield ok(page_result);
+      }
     } catch (cause) {
       yield err(
         isNotFoundError(cause)

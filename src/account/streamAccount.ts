@@ -1,6 +1,6 @@
 import { ok, err, SorokitErrorCode } from "../shared/response";
 import type { SorokitResult } from "../shared/response";
-import { sleep, toMessage } from "../shared";
+import { sleep, toMessage, deepEqual } from "../shared";
 import type { AccountInfo } from "./types";
 import { getAccount } from "./getAccount";
 
@@ -54,6 +54,7 @@ export async function* streamAccount(
   const emitOnStart = config?.emitOnStart ?? true;
 
   let polls = 0;
+  let lastEmitted: AccountInfo | undefined;
 
   while (true) {
     if (signal?.aborted) return;
@@ -74,7 +75,14 @@ export async function* streamAccount(
 
     try {
       const result = await getAccount(horizonUrl, publicKey);
-      yield result;
+      if (result.status === "ok") {
+        if (!deepEqual(result.data, lastEmitted)) {
+          lastEmitted = result.data;
+          yield result;
+        }
+      } else {
+        yield result;
+      }
     } catch (cause) {
       yield err(
         SorokitErrorCode.ACCOUNT_FETCH_FAILED,
