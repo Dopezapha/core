@@ -53,7 +53,7 @@ import type {
   AccountCreateParams,
   TransactionResult,
 } from "../transaction/types";
-import type { FeeEstimate, FeeEstimateInput } from "../transaction/estimateFee";
+import type { FeeEstimate, FeeEstimateInput, FeeEstimateOptions } from "../transaction/estimateFee";
 import type {
   TransactionStreamConfig,
   TransactionPage,
@@ -92,6 +92,8 @@ export interface SorokitClientConfig {
   logger?: SorokitLogger;
   /** Default Soroban polling config — can be overridden per-call */
   sorobanPoll?: SorobanPollConfig;
+  /** Invoked when estimateFee detects a fee surge (>2x recent median) */
+  onFeeSurge?: FeeEstimateOptions["onFeeSurge"];
 }
 
 // ─── Client interface ─────────────────────────────────────────────────────────
@@ -266,6 +268,12 @@ export function createSorokitClient(
       logLevel: config.logLevel ?? (config.debug ? "debug" : "off"),
     });
   const defaultPollConfig = config.sorobanPoll;
+  const feeEstimateOptions: FeeEstimateOptions = {
+    ...(config.cache !== undefined ? { cache: config.cache } : {}),
+    ...(config.onFeeSurge !== undefined
+      ? { onFeeSurge: config.onFeeSurge }
+      : {}),
+  };
 
   logger.info("client.create", {
     operation: "client.create",
@@ -316,32 +324,55 @@ export function createSorokitClient(
     },
 
     transaction: {
-      buildPayment: (sourcePublicKey, params) =>
-        withLogging(logger, "transaction.buildPayment", { sourcePublicKey }, () =>
-          buildPaymentTransaction(horizonUrl, networkConfig, sourcePublicKey, params),
-        ),
-      buildCreateAccount: (sourcePublicKey, params) =>
-        withLogging(logger, "transaction.buildCreateAccount", { sourcePublicKey }, () =>
-          buildCreateAccountTransaction(horizonUrl, networkConfig, sourcePublicKey, params),
-        ),
-      buildTrustline: (sourcePublicKey, params) =>
-        withLogging(logger, "transaction.buildTrustline", { sourcePublicKey }, () =>
-          buildTrustlineTransaction(horizonUrl, networkConfig, sourcePublicKey, params),
-        ),
-      submit: (signedXdr) =>
-        withLogging(logger, "transaction.submit", undefined, () =>
-          submitTransaction(horizonUrl, networkPassphrase, signedXdr),
-        ),
-      getStatus: (hash) =>
-        withLogging(logger, "transaction.getStatus", { hash }, () =>
-          getTransactionStatus(horizonUrl, hash),
-        ),
-      estimateFee: (input) =>
-        withLogging(logger, "transaction.estimateFee", { kind: input.kind }, () =>
-          estimateFee(rpcUrl, horizonUrl, networkConfig, input),
-        ),
-      stream: (publicKey, streamConfig, signal) =>
-        streamTransactions(horizonUrl, publicKey, streamConfig, signal, logger),
+      buildPayment: (sourcePublicKey, params) => {
+        logger.debug("transaction.buildPayment", { sourcePublicKey });
+        return buildPaymentTransaction(
+          horizonUrl,
+          networkConfig,
+          sourcePublicKey,
+          params,
+        );
+      },
+      buildCreateAccount: (sourcePublicKey, params) => {
+        logger.debug("transaction.buildCreateAccount", { sourcePublicKey });
+        return buildCreateAccountTransaction(
+          horizonUrl,
+          networkConfig,
+          sourcePublicKey,
+          params,
+        );
+      },
+      buildTrustline: (sourcePublicKey, params) => {
+        logger.debug("transaction.buildTrustline", { sourcePublicKey });
+        return buildTrustlineTransaction(
+          horizonUrl,
+          networkConfig,
+          sourcePublicKey,
+          params,
+        );
+      },
+      submit: (signedXdr) => {
+        logger.debug("transaction.submit");
+        return submitTransaction(horizonUrl, networkPassphrase, signedXdr);
+      },
+      getStatus: (hash) => {
+        logger.debug("transaction.getStatus", { hash });
+        return getTransactionStatus(horizonUrl, hash);
+      },
+      estimateFee: (input) => {
+        logger.debug("transaction.estimateFee");
+        return estimateFee(
+          rpcUrl,
+          horizonUrl,
+          networkConfig,
+          input,
+          feeEstimateOptions,
+        );
+      },
+      stream: (publicKey, config, signal) => {
+        logger.debug("transaction.stream", { publicKey });
+        return streamTransactions(horizonUrl, publicKey, config, signal);
+      },
     },
 
     soroban: {
