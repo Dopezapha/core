@@ -1,26 +1,16 @@
 ﻿import { describe, it, expect, vi, beforeEach } from "vitest";
-import {
-  calculateMedian,
-  isFeeSurge,
-  fetchRecentMedianFee,
-  MEDIAN_FEE_CACHE_KEY,
-} from "../transaction/feeSurge";
-import { estimateFee } from "../transaction/estimateFee";
 import type { SorokitCache } from "../shared/cache";
 import type { ResolvedNetworkConfig } from "../shared/types";
 
-const mockSimulateTransaction = vi.fn();
-const mockTransactionsCall = vi.fn();
-const mockIsSimulationSuccess = vi.fn();
-
-vi.mock("../transaction/feeSurge", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("../transaction/feeSurge")>();
-  return {
-    ...actual,
-    fetchRecentMedianFee: vi.fn(actual.fetchRecentMedianFee),
-  };
-});
+const {
+  mockSimulateTransaction,
+  mockTransactionsCall,
+  mockIsSimulationSuccess,
+} = vi.hoisted(() => ({
+  mockSimulateTransaction: vi.fn(),
+  mockTransactionsCall: vi.fn(),
+  mockIsSimulationSuccess: vi.fn(),
+}));
 
 vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@stellar/stellar-sdk")>();
@@ -56,7 +46,13 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
   };
 });
 
-import { fetchRecentMedianFee as fetchRecentMedianFeeMock } from "../transaction/feeSurge";
+import {
+  calculateMedian,
+  isFeeSurge,
+  fetchRecentMedianFee,
+  MEDIAN_FEE_CACHE_KEY,
+} from "../transaction/feeSurge";
+import { estimateFee } from "../transaction/estimateFee";
 
 const networkConfig: ResolvedNetworkConfig = {
   network: "testnet",
@@ -105,11 +101,10 @@ function mockRecentTransactionFees(fees: number[]) {
 
 describe("transaction fee surge", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
+    mockSimulateTransaction.mockReset();
+    mockTransactionsCall.mockReset();
+    mockIsSimulationSuccess.mockReset();
     mockIsSimulationSuccess.mockReturnValue(true);
-    vi.mocked(fetchRecentMedianFeeMock).mockImplementation(
-      fetchRecentMedianFee,
-    );
   });
 
   describe("calculateMedian", () => {
@@ -174,7 +169,7 @@ describe("transaction fee surge", () => {
   describe("estimateFee", () => {
     it("returns surge: false for a normal fee relative to recent median", async () => {
       mockSuccessfulSimulation(200);
-      vi.mocked(fetchRecentMedianFeeMock).mockResolvedValue(100);
+      mockRecentTransactionFees([100, 100, 100, 100, 100]);
 
       const result = await estimateFee(
         networkConfig.rpcUrl,
@@ -194,7 +189,7 @@ describe("transaction fee surge", () => {
 
     it("returns surge: true when estimated fee exceeds 2x recent median", async () => {
       mockSuccessfulSimulation(500);
-      vi.mocked(fetchRecentMedianFeeMock).mockResolvedValue(100);
+      mockRecentTransactionFees([100, 100, 100, 100, 100]);
 
       const result = await estimateFee(
         networkConfig.rpcUrl,
@@ -214,7 +209,7 @@ describe("transaction fee surge", () => {
 
     it("omits surge when recent fee history is unavailable", async () => {
       mockSuccessfulSimulation(500);
-      vi.mocked(fetchRecentMedianFeeMock).mockResolvedValue(null);
+      mockTransactionsCall.mockRejectedValue(new Error("Horizon unavailable"));
 
       const result = await estimateFee(
         networkConfig.rpcUrl,
@@ -234,7 +229,7 @@ describe("transaction fee surge", () => {
 
     it("invokes onFeeSurge callback when surge is detected", async () => {
       mockSuccessfulSimulation(500);
-      vi.mocked(fetchRecentMedianFeeMock).mockResolvedValue(100);
+      mockRecentTransactionFees([100, 100, 100, 100, 100]);
       const onFeeSurge = vi.fn();
 
       const result = await estimateFee(
@@ -255,12 +250,11 @@ describe("transaction fee surge", () => {
       }
     });
 
-    it("passes client-level cache through to median fee lookup", async () => {
+    it("uses cached median fee without calling Horizon", async () => {
       mockSuccessfulSimulation(500);
-      const cache = createMockCache();
-      vi.mocked(fetchRecentMedianFeeMock).mockResolvedValue(100);
+      const cache = createMockCache(100);
 
-      await estimateFee(
+      const result = await estimateFee(
         networkConfig.rpcUrl,
         networkConfig.horizonUrl,
         networkConfig,
@@ -271,10 +265,11 @@ describe("transaction fee surge", () => {
         { cache },
       );
 
-      expect(fetchRecentMedianFeeMock).toHaveBeenCalledWith(
-        networkConfig.horizonUrl,
-        cache,
-      );
+      expect(result.status).toBe("ok");
+      expect(mockTransactionsCall).not.toHaveBeenCalled();
+      if (result.status === "ok") {
+        expect(result.data.surge).toBe(true);
+      }
     });
   });
 });
