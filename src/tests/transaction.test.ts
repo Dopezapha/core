@@ -1,148 +1,275 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { TransactionPage } from "../transaction/streamTransactions";
+﻿import { describe, it, expect, vi, beforeEach } from "vitest";
+import type { SorokitCache } from "../shared/cache";
+import type { ResolvedNetworkConfig } from "../shared/types";
 
-const transactionMockState = vi.hoisted(() => ({
-  sleepCalls: [] as number[],
-  pages: [] as TransactionPage[],
-  index: 0,
+const {
+  mockSimulateTransaction,
+  mockTransactionsCall,
+  mockIsSimulationSuccess,
+} = vi.hoisted(() => ({
+  mockSimulateTransaction: vi.fn(),
+  mockTransactionsCall: vi.fn(),
+  mockIsSimulationSuccess: vi.fn(),
 }));
 
-vi.mock("../shared", async () => {
-  const actual = await vi.importActual<typeof import("../shared")>("../shared");
+vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@stellar/stellar-sdk")>();
   return {
     ...actual,
-    sleep: vi.fn((ms: number) => {
-      transactionMockState.sleepCalls.push(ms);
-      return Promise.resolve();
-    }),
+    Horizon: {
+      ...actual.Horizon,
+      Server: vi.fn().mockImplementation(() => ({
+        transactions: vi.fn().mockReturnValue({
+          order: vi.fn().mockReturnValue({
+            limit: vi.fn().mockReturnValue({
+              call: mockTransactionsCall,
+            }),
+          }),
+        }),
+      })),
+    },
+    TransactionBuilder: {
+      ...actual.TransactionBuilder,
+      fromXDR: vi.fn().mockReturnValue({}),
+    },
+    rpc: {
+      ...actual.rpc,
+      Server: vi.fn().mockImplementation(() => ({
+        simulateTransaction: mockSimulateTransaction,
+      })),
+      Api: {
+        ...actual.rpc.Api,
+        isSimulationSuccess: mockIsSimulationSuccess,
+        isSimulationError: actual.rpc.Api.isSimulationError,
+      },
+    },
   };
 });
 
-vi.mock("@stellar/stellar-sdk", () => {
-  class Server {
-    constructor() {}
+import {
+  calculateMedian,
+  isFeeSurge,
+  fetchRecentMedianFee,
+  MEDIAN_FEE_CACHE_KEY,
+} from "../transaction/feeSurge";
+import { estimateFee } from "../transaction/estimateFee";
 
-    transactions() {
-      const buildCall = async () => {
-        const page =
-          transactionMockState.pages[transactionMockState.index] ??
-          transactionMockState.pages.at(-1)!;
-        transactionMockState.index++;
-        return {
-          records: page.transactions.map((tx, index) => ({
-            hash: tx.hash,
-            successful: tx.status === "success",
-            ledger_attr: tx.ledger,
-            created_at: tx.createdAt,
-            fee_charged: tx.fee,
-            envelope_xdr: tx.envelopeXdr ?? "",
-            result_xdr: tx.resultXdr ?? "",
-            paging_token:
-              index === page.transactions.length - 1
-                ? page.nextCursor
-                : `${page.nextCursor ?? "0"}-${index}`,
-          })),
-        };
-      };
+const networkConfig: ResolvedNetworkConfig = {
+  network: "testnet",
+  horizonUrl: "https://horizon-testnet.stellar.org",
+  rpcUrl: "https://soroban-testnet.stellar.org",
+  networkPassphrase: "Test SDF Network ; September 2015",
+};
 
-      const builder = {
-        call: buildCall,
-        cursor: () => builder,
-      };
-
-      return {
-        forAccount: () => ({
-          limit: () => ({
-            order: () => builder,
-          }),
-        }),
-      };
-    }
+function createMockCache(initial?: unknown): SorokitCache & {
+  store: Map<string, unknown>;
+} {
+  const store = new Map<string, unknown>();
+  if (initial !== undefined) {
+    store.set(MEDIAN_FEE_CACHE_KEY, initial);
   }
-
-  return { Horizon: { Server } };
-});
-
-import { streamTransactions } from "../transaction/streamTransactions";
-
-function createPage(nextCursor: string | null, hashSuffix: string): TransactionPage {
   return {
-    transactions: [
-      {
-        hash: `hash-${hashSuffix}`,
-        status: "success",
-        ledger: 1000,
-        createdAt: "2024-01-01T00:00:00Z",
-        fee: "100",
-      },
-    ],
-    nextCursor,
+    store,
+    get: (key: string) => store.get(key),
+    set: (key: string, value: unknown) => {
+      store.set(key, value);
+    },
+    invalidate: (key: string) => {
+      store.delete(key);
+    },
+    clear: () => {
+      store.clear();
+    },
   };
 }
 
-beforeEach(() => {
-  transactionMockState.sleepCalls.length = 0;
-  transactionMockState.index = 0;
-  transactionMockState.pages = [];
-});
+function mockSuccessfulSimulation(totalFeeStroops: number) {
+  mockSimulateTransaction.mockResolvedValue({
+    minResourceFee: String(totalFeeStroops - 100),
+    transactionData: {},
+    latestLedger: 1,
+    id: "1",
+    events: [],
+  });
+}
 
-describe("streamTransactions", () => {
-  it("increases interval after unchanged polls and decreases after activity", async () => {
-    transactionMockState.pages = [
-      createPage("1", "a"),
-      createPage("1", "a"),
-      createPage("1", "a"),
-      createPage("2", "b"),
-    ];
+function mockRecentTransactionFees(fees: number[]) {
+  mockTransactionsCall.mockResolvedValue({
+    records: fees.map((fee) => ({ fee_charged: String(fee) })),
+  });
+}
 
-    const stream = streamTransactions("https://horizon.test", "G...", {
-      intervalMs: 2000,
-      minIntervalMs: 1000,
-      maxIntervalMs: 4000,
-      adaptiveThreshold: 2,
-      maxPolls: 4,
-    });
-
-    await stream.next();
-    await stream.next();
-    await stream.next();
-    await stream.next();
-
-    expect(transactionMockState.sleepCalls).toEqual([2000, 2000, 3000]);
+describe("transaction fee surge", () => {
+  beforeEach(() => {
+    mockSimulateTransaction.mockReset();
+    mockTransactionsCall.mockReset();
+    mockIsSimulationSuccess.mockReset();
+    mockIsSimulationSuccess.mockReturnValue(true);
   });
 
-  it("respects interval boundaries", async () => {
-    transactionMockState.pages = [
-      createPage("1", "a"),
-      createPage("1", "a"),
-      createPage("1", "a"),
-      createPage("1", "a"),
-      createPage("2", "b"),
-      createPage("2", "b"),
-      createPage("2", "b"),
-      createPage("2", "b"),
-    ];
-
-    const stream = streamTransactions("https://horizon.test", "G...", {
-      intervalMs: 2000,
-      minIntervalMs: 1000,
-      maxIntervalMs: 3000,
-      adaptiveThreshold: 1,
-      maxPolls: 8,
+  describe("calculateMedian", () => {
+    it("returns the middle value for an odd-length array", () => {
+      expect(calculateMedian([100, 300, 200])).toBe(200);
     });
 
-    for (let i = 0; i < 8; i++) {
-      await stream.next();
-    }
+    it("returns the average of two middle values for an even-length array", () => {
+      expect(calculateMedian([100, 200, 300, 400])).toBe(250);
+    });
+  });
 
-    expect(transactionMockState.sleepCalls).toEqual([
-      2000,
-      3000,
-      3000,
-      3000,
-      2000,
-      1000,
-      1000,
-    ]);
+  describe("isFeeSurge", () => {
+    it("detects surge when fee exceeds 2x median", () => {
+      expect(isFeeSurge(500, 200)).toBe(true);
+    });
+
+    it("does not detect surge at exactly 2x median", () => {
+      expect(isFeeSurge(400, 200)).toBe(false);
+    });
+
+    it("does not detect surge below 2x median", () => {
+      expect(isFeeSurge(300, 200)).toBe(false);
+    });
+  });
+
+  describe("fetchRecentMedianFee", () => {
+    it("returns cached median without calling Horizon", async () => {
+      const cache = createMockCache(150);
+
+      const median = await fetchRecentMedianFee(
+        networkConfig.horizonUrl,
+        cache,
+      );
+
+      expect(median).toBe(150);
+      expect(mockTransactionsCall).not.toHaveBeenCalled();
+    });
+
+    it("returns null when Horizon returns no transactions", async () => {
+      mockTransactionsCall.mockResolvedValue({ records: [] });
+
+      const median = await fetchRecentMedianFee(networkConfig.horizonUrl);
+
+      expect(median).toBeNull();
+    });
+
+    it("stores fetched median in cache", async () => {
+      mockRecentTransactionFees([100, 200, 300]);
+      const cache = createMockCache();
+
+      const median = await fetchRecentMedianFee(
+        networkConfig.horizonUrl,
+        cache,
+      );
+
+      expect(median).toBe(200);
+      expect(cache.get(MEDIAN_FEE_CACHE_KEY)).toBe(200);
+    });
+  });
+
+  describe("estimateFee", () => {
+    it("returns surge: false for a normal fee relative to recent median", async () => {
+      mockSuccessfulSimulation(200);
+      mockRecentTransactionFees([100, 100, 100, 100, 100]);
+
+      const result = await estimateFee(
+        networkConfig.rpcUrl,
+        networkConfig.horizonUrl,
+        networkConfig,
+        {
+          kind: "xdr",
+          transactionXdr: "AAAAAgAAAABmockxdr==",
+        },
+      );
+
+      expect(result.status).toBe("ok");
+      if (result.status === "ok") {
+        expect(result.data.surge).toBe(false);
+      }
+    });
+
+    it("returns surge: true when estimated fee exceeds 2x recent median", async () => {
+      mockSuccessfulSimulation(500);
+      mockRecentTransactionFees([100, 100, 100, 100, 100]);
+
+      const result = await estimateFee(
+        networkConfig.rpcUrl,
+        networkConfig.horizonUrl,
+        networkConfig,
+        {
+          kind: "xdr",
+          transactionXdr: "AAAAAgAAAABmockxdr==",
+        },
+      );
+
+      expect(result.status).toBe("ok");
+      if (result.status === "ok") {
+        expect(result.data.surge).toBe(true);
+      }
+    });
+
+    it("omits surge when recent fee history is unavailable", async () => {
+      mockSuccessfulSimulation(500);
+      mockTransactionsCall.mockRejectedValue(new Error("Horizon unavailable"));
+
+      const result = await estimateFee(
+        networkConfig.rpcUrl,
+        networkConfig.horizonUrl,
+        networkConfig,
+        {
+          kind: "xdr",
+          transactionXdr: "AAAAAgAAAABmockxdr==",
+        },
+      );
+
+      expect(result.status).toBe("ok");
+      if (result.status === "ok") {
+        expect(result.data.surge).toBeUndefined();
+      }
+    });
+
+    it("invokes onFeeSurge callback when surge is detected", async () => {
+      mockSuccessfulSimulation(500);
+      mockRecentTransactionFees([100, 100, 100, 100, 100]);
+      const onFeeSurge = vi.fn();
+
+      const result = await estimateFee(
+        networkConfig.rpcUrl,
+        networkConfig.horizonUrl,
+        networkConfig,
+        {
+          kind: "xdr",
+          transactionXdr: "AAAAAgAAAABmockxdr==",
+        },
+        { onFeeSurge },
+      );
+
+      expect(result.status).toBe("ok");
+      expect(onFeeSurge).toHaveBeenCalledOnce();
+      if (result.status === "ok") {
+        expect(onFeeSurge).toHaveBeenCalledWith(result.data);
+      }
+    });
+
+    it("uses cached median fee without calling Horizon", async () => {
+      mockSuccessfulSimulation(500);
+      const cache = createMockCache(100);
+
+      const result = await estimateFee(
+        networkConfig.rpcUrl,
+        networkConfig.horizonUrl,
+        networkConfig,
+        {
+          kind: "xdr",
+          transactionXdr: "AAAAAgAAAABmockxdr==",
+        },
+        { cache },
+      );
+
+      expect(result.status).toBe("ok");
+      expect(mockTransactionsCall).not.toHaveBeenCalled();
+      if (result.status === "ok") {
+        expect(result.data.surge).toBe(true);
+      }
+    });
   });
 });

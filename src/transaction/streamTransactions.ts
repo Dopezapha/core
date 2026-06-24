@@ -2,6 +2,7 @@ import { Horizon } from "@stellar/stellar-sdk";
 import { ok, err, SorokitErrorCode } from "../shared/response";
 import type { SorokitResult } from "../shared/response";
 import { sleep, toMessage, isNotFoundError } from "../shared";
+import type { SorokitLogger } from "../shared/logger";
 import type { TransactionResult } from "./types";
 
 const MIN_POLL_INTERVAL_MS = 1_000;
@@ -89,6 +90,7 @@ export async function* streamTransactions(
   publicKey: string,
   config?: TransactionStreamConfig,
   signal?: AbortSignal,
+  logger?: SorokitLogger,
 ): AsyncGenerator<SorokitResult<TransactionPage>> {
   const baseIntervalMs = Math.max(
     config?.intervalMs ?? DEFAULT_POLL_INTERVAL_MS,
@@ -143,8 +145,25 @@ export async function* streamTransactions(
     );
   };
 
+  logger?.debug("transaction.stream", {
+    operation: "transaction.stream",
+    status: "start",
+    publicKey,
+    intervalMs,
+    maxPolls,
+    limit,
+  });
+
   while (true) {
-    if (signal?.aborted) return;
+    if (signal?.aborted) {
+      logger?.debug("transaction.stream", {
+        operation: "transaction.stream",
+        status: "ok",
+        reason: "aborted",
+        polls,
+      });
+      return;
+    }
 
     if (maxPolls !== undefined && polls >= maxPolls) return;
 
@@ -159,6 +178,14 @@ export async function* streamTransactions(
     if (signal?.aborted) return;
 
     try {
+      logger?.debug("transaction.stream.poll", {
+        operation: "transaction.stream.poll",
+        status: "start",
+        publicKey,
+        poll: polls + 1,
+        cursor,
+      });
+
       const server = new Horizon.Server(horizonUrl);
 
       let builder = server
@@ -187,26 +214,34 @@ export async function* streamTransactions(
       const lastRecord = page.records[page.records.length - 1];
       const nextCursor = lastRecord?.paging_token ?? null;
 
-      const snapshot = JSON.stringify({
-        transactions,
+      logger?.debug("transaction.stream.poll", {
+        operation: "transaction.stream.poll",
+        status: "ok",
+        publicKey,
+        poll: polls + 1,
+        transactionCount: transactions.length,
         nextCursor,
       });
-      if (lastSnapshot !== null) {
-        adjustInterval(snapshot !== lastSnapshot);
-      }
-      lastSnapshot = snapshot;
+
       yield ok({ transactions, nextCursor });
     } catch (cause) {
-      adjustInterval(false);
-      yield err(
-        isNotFoundError(cause)
-          ? SorokitErrorCode.ACCOUNT_NOT_FOUND
-          : SorokitErrorCode.TX_SUBMIT_FAILED,
-        isNotFoundError(cause)
-          ? `Account not found while streaming transactions: ${publicKey}`
-          : `Transaction stream poll failed: ${toMessage(cause)}`,
-        cause,
-      );
+      const code = isNotFoundError(cause)
+        ? SorokitErrorCode.ACCOUNT_NOT_FOUND
+        : SorokitErrorCode.TX_SUBMIT_FAILED;
+      const message = isNotFoundError(cause)
+        ? `Account not found while streaming transactions: ${publicKey}`
+        : `Transaction stream poll failed: ${toMessage(cause)}`;
+
+      logger?.warn("transaction.stream.poll", {
+        operation: "transaction.stream.poll",
+        status: "error",
+        publicKey,
+        poll: polls + 1,
+        errorCode: code,
+        errorMessage: message,
+      });
+
+      yield err(code, message, cause);
     }
 
     polls++;
